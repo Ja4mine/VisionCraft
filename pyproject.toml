@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "visioncraft-aura"
+version = "0.1.0"
+description = "A command-line learning planning assistant powered by DeepSeek."
+requires-python = ">=3.10"
+dependencies = [
+    "typer",
+    "rich",
+    "openai",
+    "prompt_toolkit",
+]
+
+[project.scripts]
+aura = "aura.main:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
