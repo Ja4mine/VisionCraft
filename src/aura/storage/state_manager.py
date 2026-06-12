@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import TypeAlias
 
@@ -52,6 +53,19 @@ class StoredDailyCheckIn:
     blockers: str
     energy: str
     notes: str
+
+
+@dataclass(frozen=True, slots=True)
+class StoredLearningTask:
+    """A sequence-based learning task without a hard due date."""
+
+    id: int
+    plan_id: int
+    sequence_day: int
+    title: str
+    energy_level: int
+    status: str
+    node_id: str
 
 
 class StateManager:
@@ -170,6 +184,32 @@ class StateManager:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS learning_tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    plan_id INTEGER NOT NULL,
+                    sequence_day INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    energy_level INTEGER NOT NULL DEFAULT 3,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    node_id TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (plan_id) REFERENCES learning_plans (id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS skill_trees (
+                    plan_id INTEGER PRIMARY KEY,
+                    tree_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (plan_id) REFERENCES learning_plans (id)
+                )
+                """
+            )
 
     def save_clarification_draft(
         self,
@@ -200,6 +240,39 @@ class StateManager:
                 ),
             )
             return int(cursor.lastrowid)
+
+    def create_tasks_from_plan_markdown(self, plan_id: int, markdown: str) -> None:
+        """Extract sequence tasks from plan Markdown and store them without due dates."""
+
+        tasks = self._extract_tasks(markdown)
+        if not tasks:
+            tasks = [
+                {
+                    "sequence_day": 1,
+                    "title": "回顾当前计划并完成 10 分钟启动任务",
+                    "energy_level": 1,
+                    "node_id": "",
+                }
+            ]
+        self.initialize()
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute("DELETE FROM learning_tasks WHERE plan_id = ?", (plan_id,))
+            connection.executemany(
+                """
+                INSERT INTO learning_tasks (plan_id, sequence_day, title, energy_level, node_id)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        plan_id,
+                        task["sequence_day"],
+                        task["title"],
+                        task["energy_level"],
+                        task["node_id"],
+                    )
+                    for task in tasks
+                ],
+            )
 
     def create_clarification_session(self, goal: str) -> int:
         """Start tracking a goal clarification session."""
@@ -630,6 +703,117 @@ class StateManager:
             for row in reversed(rows)
         ]
 
+    def get_missed_days(self, plan_id: int) -> int:
+        """Return silent gap days since the latest check-in, never as overdue."""
+
+        self.initialize()
+        with sqlite3.connect(self.db_path) as connection:
+            row = connection.execute(
+                """
+                SELECT MAX(checkin_date)
+                FROM daily_checkins
+                WHERE plan_id IN (
+                    SELECT id
+                    FROM learning_plans
+                    WHERE goal = (
+                        SELECT goal
+                        FROM learning_plans
+                        WHERE id = ?
+                    )
+                )
+                """,
+                (plan_id,),
+            ).fetchone()
+        if not row or not row[0]:
+            return 0
+        latest = datetime.strptime(str(row[0]), "%Y-%m-%d").date()
+        return max((date.today() - latest).days - 1, 0)
+
+    def get_current_sequence(self, plan_id: int) -> int:
+        """Return the next unfinished sequence day."""
+
+        self.initialize()
+        with sqlite3.connect(self.db_path) as connection:
+            row = connection.execute(
+                """
+                SELECT MIN(sequence_day)
+                FROM learning_tasks
+                WHERE plan_id = ?
+                  AND status != 'completed'
+                """,
+                (plan_id,),
+            ).fetchone()
+        return int(row[0]) if row and row[0] is not None else 1
+
+    def get_energy_matched_tasks(
+        self,
+        plan_id: int,
+        energy_level: int,
+        current_sequence: int,
+        limit: int = 8,
+    ) -> list[StoredLearningTask]:
+        """Return tasks at or below the user's energy threshold."""
+
+        self.initialize()
+        with sqlite3.connect(self.db_path) as connection:
+            rows = connection.execute(
+                """
+                SELECT id, plan_id, sequence_day, title, energy_level, status, node_id
+                FROM learning_tasks
+                WHERE plan_id = ?
+                  AND sequence_day >= ?
+                  AND energy_level <= ?
+                  AND status != 'completed'
+                ORDER BY sequence_day ASC, energy_level ASC, id ASC
+                LIMIT ?
+                """,
+                (plan_id, current_sequence, energy_level, limit),
+            ).fetchall()
+
+        return [
+            StoredLearningTask(
+                id=int(row[0]),
+                plan_id=int(row[1]),
+                sequence_day=int(row[2]),
+                title=str(row[3]),
+                energy_level=int(row[4]),
+                status=str(row[5]),
+                node_id=str(row[6]),
+            )
+            for row in rows
+        ]
+
+    def save_skill_tree(self, plan_id: int, tree_json: str) -> None:
+        """Persist a skill tree DAG JSON blob for a plan."""
+
+        self.initialize()
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO skill_trees (plan_id, tree_json)
+                VALUES (?, ?)
+                ON CONFLICT(plan_id) DO UPDATE SET
+                    tree_json = excluded.tree_json,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (plan_id, tree_json),
+            )
+
+    def get_skill_tree(self, plan_id: int) -> str | None:
+        """Return stored skill tree JSON for a plan."""
+
+        self.initialize()
+        with sqlite3.connect(self.db_path) as connection:
+            row = connection.execute(
+                """
+                SELECT tree_json
+                FROM skill_trees
+                WHERE plan_id = ?
+                """,
+                (plan_id,),
+            ).fetchone()
+        return str(row[0]) if row and row[0] else None
+
     def replace_active_plan(
         self,
         old_plan_id: int,
@@ -744,3 +928,33 @@ class StateManager:
         for column, statement in migrations.items():
             if column not in columns:
                 connection.execute(statement)
+
+    def _extract_tasks(self, markdown: str) -> list[dict[str, int | str]]:
+        tasks: list[dict[str, int | str]] = []
+        current_sequence = 1
+        for line in markdown.splitlines():
+            sequence_match = re.search(r"Sequence Day\s*(\d+)|sequence_day\s*[:：]\s*(\d+)", line, re.I)
+            if sequence_match:
+                current_sequence = int(next(group for group in sequence_match.groups() if group))
+
+            energy_match = re.search(r"energy_level\s*[:：]\s*([1-5])", line, re.I)
+            task_match = re.search(r"(?:^[-*]\s+\[[ xX]\]\s*|^[-*]\s+)(.+)", line)
+            if not energy_match or not task_match:
+                continue
+
+            title = re.sub(r"energy_level\s*[:：]\s*[1-5]", "", task_match.group(1), flags=re.I)
+            title = re.sub(r"sequence_day\s*[:：]\s*\d+", "", title, flags=re.I)
+            title = title.strip(" |-")
+            if not title:
+                continue
+
+            node_match = re.search(r"node_id\s*[:：]\s*([\w-]+)", line, re.I)
+            tasks.append(
+                {
+                    "sequence_day": current_sequence,
+                    "title": title,
+                    "energy_level": int(energy_match.group(1)),
+                    "node_id": node_match.group(1) if node_match else "",
+                }
+            )
+        return tasks

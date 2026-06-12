@@ -10,6 +10,7 @@ from openai import OpenAI
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.prompt import IntPrompt
 
 from aura import __version__
 from aura.agents.clarifier import (
@@ -24,6 +25,11 @@ from aura.agents.plan_generator import (
     PlanGenerator,
 )
 from aura.agents.resource_researcher import ResourceResearcher
+from aura.agents.scheduler import (
+    HumanCentricScheduler,
+    SchedulerError,
+    SchedulerTask,
+)
 from aura.agents.tracker import (
     AdjustedPlan,
     CheckInReport,
@@ -35,6 +41,12 @@ from aura.core.input import TerminalInput
 from aura.core.llm_client import DeepSeekClientFactory
 from aura.core.obsidian import ObsidianExporter
 from aura.storage.state_manager import StateManager
+from aura.topology.generator import (
+    TopologyError,
+    TopologyGenerator,
+    parse_topology,
+)
+from aura.topology.renderer import TopologyRenderer
 
 
 class AuraCLI:
@@ -83,6 +95,7 @@ class AuraCLI:
         self.app.command("config")(self.config)
         self.app.command("init")(self.init)
         self.app.command("daily")(self.daily)
+        self.app.command("tree")(self.tree)
         self.goal_app.command("add")(self.goal_add)
         self.app.add_typer(self.goal_app, name="goal")
         self.memory_app.command("show")(self.memory_show)
@@ -517,6 +530,45 @@ class AuraCLI:
             self.console.print("[red]没有找到可打卡的学习计划，请先运行 `aura plan generate`。[/red]")
             raise typer.Exit(code=1)
 
+        energy_level = self._ask_energy_level()
+        missed_days = self.state_manager.get_missed_days(plan.id)
+        current_sequence = self.state_manager.get_current_sequence(plan.id)
+        task_pool = [
+            SchedulerTask(
+                task_id=task.id,
+                title=task.title,
+                sequence_day=task.sequence_day,
+                energy_level=task.energy_level,
+            )
+            for task in self.state_manager.get_energy_matched_tasks(
+                plan_id=plan.id,
+                energy_level=energy_level,
+                current_sequence=current_sequence,
+            )
+        ]
+        if not task_pool:
+            self.state_manager.create_tasks_from_plan_markdown(plan.id, plan.markdown)
+            current_sequence = self.state_manager.get_current_sequence(plan.id)
+            task_pool = [
+                SchedulerTask(
+                    task_id=task.id,
+                    title=task.title,
+                    sequence_day=task.sequence_day,
+                    energy_level=task.energy_level,
+                )
+                for task in self.state_manager.get_energy_matched_tasks(
+                    plan_id=plan.id,
+                    energy_level=energy_level,
+                    current_sequence=current_sequence,
+                )
+            ]
+        decision = self._schedule_today(
+            missed_days=missed_days,
+            current_sequence=current_sequence,
+            energy_level=energy_level,
+            task_pool=task_pool,
+        )
+
         self.console.print(
             Panel.fit(
                 f"计划 #{plan.id}: {plan.title}\n文件路径: {plan.output_path}",
@@ -524,8 +576,15 @@ class AuraCLI:
                 border_style="cyan",
             )
         )
+        self.console.print(
+            Panel(
+                Markdown(self._scheduler_decision_to_markdown(decision)),
+                title="今日柔性安排",
+                border_style="blue",
+            )
+        )
 
-        checkin = self._collect_daily_checkin()
+        checkin = self._collect_daily_checkin(energy_level=energy_level)
         checkin_id = self.state_manager.save_daily_checkin(
             plan_id=plan.id,
             completed=checkin.completed,
@@ -566,6 +625,47 @@ class AuraCLI:
         except (ValueError, TrackerError) as exc:
             self.console.print(f"[red]计划调整失败：{exc}[/red]")
             raise typer.Exit(code=1) from exc
+
+    def tree(
+        self,
+        plan_id: Annotated[
+            int | None,
+            typer.Option("--plan-id", "-p", help="指定计划 ID。默认使用最新 active 计划。"),
+        ] = None,
+        regenerate: Annotated[
+            bool,
+            typer.Option("--regenerate", help="忽略已存技能树，重新调用 LLM 生成。"),
+        ] = False,
+    ) -> None:
+        """Render the current plan as a game-like skill tree."""
+
+        plan = self.state_manager.get_learning_plan(plan_id=plan_id)
+        if plan is None:
+            self.console.print("[red]没有找到可展示的学习计划，请先运行 `aura plan generate`。[/red]")
+            raise typer.Exit(code=1)
+
+        topology_json = None if regenerate else self.state_manager.get_skill_tree(plan.id)
+        if topology_json is None:
+            settings = self.config_manager.load()
+            if not settings.has_api_key:
+                self.console.print("[red]当前计划还没有目标拓扑，且 DeepSeek API Key 未配置，无法生成。[/red]")
+                raise typer.Exit(code=1)
+            try:
+                client = DeepSeekClientFactory(settings).create()
+                with self.console.status("[bold cyan]Aura 正在生成目标拓扑...[/bold cyan]", spinner="dots"):
+                    topology = TopologyGenerator(client=client, model=settings.model).generate(
+                        goal=plan.goal,
+                        plan_markdown=plan.markdown,
+                    )
+                topology_json = topology.to_json()
+                self.state_manager.save_skill_tree(plan.id, topology_json)
+            except (ValueError, TopologyError) as exc:
+                self.console.print(f"[red]目标拓扑生成失败：{exc}[/red]")
+                raise typer.Exit(code=1) from exc
+        else:
+            topology = parse_topology(topology_json)
+
+        TopologyRenderer(self.console).render(topology)
 
     def _render_clarification_result(
         self,
@@ -644,6 +744,14 @@ class AuraCLI:
             markdown=generated_plan.markdown,
             output_path=generated_plan.output_path,
         )
+        self.state_manager.create_tasks_from_plan_markdown(plan_id, generated_plan.markdown)
+        self._ensure_skill_tree(
+            plan_id=plan_id,
+            markdown=generated_plan.markdown,
+            client=client,
+            model=model,
+            goal=goal,
+        )
         if session_id is not None:
             self.state_manager.update_clarification_session(
                 session_id=session_id,
@@ -669,7 +777,34 @@ class AuraCLI:
 
         return bundle.to_markdown_context()
 
-    def _collect_daily_checkin(self) -> CheckInReport:
+    def _ensure_skill_tree(
+        self,
+        plan_id: int,
+        markdown: str,
+        client: OpenAI,
+        model: str,
+        goal: str = "",
+    ) -> None:
+        if self.state_manager.get_skill_tree(plan_id) is not None:
+            return
+        try:
+            topology = TopologyGenerator(client=client, model=model).generate(
+                goal=goal,
+                plan_markdown=markdown,
+            )
+            self.state_manager.save_skill_tree(plan_id, topology.to_json())
+        except TopologyError:
+            return
+
+    def _ask_energy_level(self) -> int:
+        value = IntPrompt.ask(
+            "你今天感觉精力如何？[1(疲惫)-5(专注)]",
+            choices=["1", "2", "3", "4", "5"],
+            default=3,
+        )
+        return int(value)
+
+    def _collect_daily_checkin(self, energy_level: int) -> CheckInReport:
         completed_text = self.terminal_input.ask("今天是否完成计划任务？(y/n)")
         completed = completed_text.strip().lower() in {"y", "yes", "是", "完成", "done"}
         return CheckInReport(
@@ -677,9 +812,43 @@ class AuraCLI:
             time_spent=self.terminal_input.ask("今天学习了多久？例如 2h / 45min"),
             progress=self.terminal_input.ask("今天具体完成了什么？"),
             blockers=self.terminal_input.ask("遇到哪些卡点或阻碍？没有可填 无"),
-            energy=self.terminal_input.ask("今天精力状态 1-5 分？"),
+            energy=str(energy_level),
             notes=self.terminal_input.ask("还有什么需要 Aura 记住？没有可填 无"),
         )
+
+    def _schedule_today(
+        self,
+        missed_days: int,
+        current_sequence: int,
+        energy_level: int,
+        task_pool: list[SchedulerTask],
+    ):
+        settings = self.config_manager.load()
+        scheduler: HumanCentricScheduler
+        if settings.has_api_key:
+            try:
+                client = DeepSeekClientFactory(settings).create()
+                scheduler = HumanCentricScheduler(client=client, model=settings.model)
+                return scheduler.reschedule(
+                    missed_days=missed_days,
+                    current_sequence=current_sequence,
+                    energy_level=energy_level,
+                    task_pool=task_pool,
+                )
+            except (ValueError, SchedulerError):
+                pass
+
+        return HumanCentricScheduler.fallback_decision(
+            missed_days=missed_days,
+            current_sequence=current_sequence,
+            energy_level=energy_level,
+            task_pool=task_pool,
+        )
+
+    def _scheduler_decision_to_markdown(self, decision) -> str:
+        from aura.agents.daily_tracker import decision_to_markdown
+
+        return decision_to_markdown(decision)
 
     def _adjust_plan(
         self,
@@ -710,6 +879,14 @@ class AuraCLI:
             title=adjusted_plan.title,
             markdown=adjusted_plan.markdown,
             output_path=adjusted_plan.output_path,
+        )
+        self.state_manager.create_tasks_from_plan_markdown(new_plan_id, adjusted_plan.markdown)
+        self._ensure_skill_tree(
+            plan_id=new_plan_id,
+            markdown=adjusted_plan.markdown,
+            client=client,
+            model=model,
+            goal=plan_title,
         )
         self.console.print(
             Panel.fit(

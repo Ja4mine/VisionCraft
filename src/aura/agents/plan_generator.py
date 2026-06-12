@@ -21,6 +21,8 @@ PLAN_GENERATOR_SYSTEM_PROMPT = """
 4. 对高风险目标，用安全替代目标表达：Windows/macOS 系统原理、网络协议、EDR/AV 检测原理、日志与遥测、实验室内 toy agent 架构、防御验证与检测规则编写。
 5. 计划要能用于后续每日打卡，因此任务必须具体到可检查。
 6. 如果用户长期表现出拖延或中断，降低初始难度和每日负担。
+7. 每个可执行子任务必须标注 `sequence_day: N` 和 `energy_level: 1-5`，不要绑定自然日期。
+8. 高认知负荷任务使用 energy_level 4-5，低摩擦复习/阅读/整理任务使用 energy_level 1-2。
 
 Markdown 结构必须包含：
 # <目标名称>
@@ -32,6 +34,10 @@ Markdown 结构必须包含：
 ## 今日启动任务
 ## 检查点与验收标准
 ## 调整规则
+
+任务格式示例：
+- [ ] sequence_day: 1 | energy_level: 2 | 阅读 Microsoft Learn 的 Windows 进程基础并写 5 条笔记
+- [ ] sequence_day: 3 | energy_level: 5 | 在授权实验室中分析一段样例遥测并总结检测点
 """.strip()
 
 
