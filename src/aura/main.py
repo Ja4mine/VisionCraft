@@ -99,6 +99,7 @@ class AuraCLI:
         self.app.command("daily")(self.daily)
         self.app.command("tree")(self.tree)
         self.goal_app.command("add")(self.goal_add)
+        self.goal_app.command("resume")(self.goal_resume)
         self.app.add_typer(self.goal_app, name="goal")
         self.memory_app.command("show")(self.memory_show)
         self.app.add_typer(self.memory_app, name="memory")
@@ -258,7 +259,7 @@ class AuraCLI:
         max_questions: Annotated[
             int,
             typer.Option("--max-questions", "-m", help="最多允许 Aura 连续追问的轮数。"),
-        ] = 8,
+        ] = 15,
         debug: Annotated[
             bool,
             typer.Option("--debug", help="显示 Clarification Agent 的内部判断。"),
@@ -349,7 +350,8 @@ class AuraCLI:
                     draft_id = self._save_goal_draft(raw_goal, messages, current_summary, "max_questions_reached")
                     self.console.print(
                         Panel.fit(
-                            f"已达到最大追问轮数，当前对话已保存为草稿 #{draft_id}。",
+                            f"已达到最大追问轮数，当前对话已保存为草稿 #{draft_id}。\n"
+                            f"之后可运行 `aura goal resume --draft-id {draft_id}` 继续。",
                             title="目标拆解暂停",
                             border_style="yellow",
                         )
@@ -416,6 +418,183 @@ class AuraCLI:
             self.console.print(f"[red]计划生成失败：{exc}[/red]")
             raise typer.Exit(code=1) from exc
 
+    def goal_resume(
+        self,
+        draft_id: Annotated[
+            int,
+            typer.Option("--draft-id", "-d", help="要恢复的目标拆解草稿 ID。"),
+        ],
+        max_questions: Annotated[
+            int,
+            typer.Option("--max-questions", "-m", help="本次恢复最多允许 Aura 继续追问的轮数。"),
+        ] = 15,
+        debug: Annotated[
+            bool,
+            typer.Option("--debug", help="显示 Clarification Agent 的内部判断。"),
+        ] = False,
+        no_plan: Annotated[
+            bool,
+            typer.Option("--no-plan", help="只完成目标拆解，不生成学习计划。"),
+        ] = False,
+        web: Annotated[
+            bool,
+            typer.Option("--web/--no-web", help="生成计划前是否联网检索学习资料。"),
+        ] = True,
+    ) -> None:
+        """Resume a saved clarification draft and optionally generate a plan."""
+
+        draft = self.state_manager.get_clarification_draft(draft_id)
+        if draft is None:
+            self.console.print(f"[red]草稿 #{draft_id} 不存在。[/red]")
+            raise typer.Exit(code=1)
+        if max_questions < 1:
+            self.console.print("[red]--max-questions 必须大于 0。[/red]")
+            raise typer.Exit(code=1)
+
+        settings = self.config_manager.load()
+        if not settings.has_api_key:
+            self.console.print("[red]DeepSeek API Key 尚未配置，请先运行 `aura config`。[/red]")
+            raise typer.Exit(code=1)
+
+        client = DeepSeekClientFactory(settings).create()
+        clarifier = ClarificationAgent(client=client, model=settings.model)
+        messages = list(draft.messages)
+        session_id = self.state_manager.create_clarification_session(draft.goal)
+        current_summary = draft.current_summary
+
+        self.console.print(
+            Panel.fit(
+                f"已恢复草稿 #{draft.id}。\nAura 会从上次中断处继续追问。",
+                title="继续目标拆解",
+                border_style="cyan",
+            )
+        )
+
+        try:
+            result = self._result_from_last_assistant(clarifier, messages)
+            if result is None:
+                result = self._request_clarification(clarifier, messages)
+
+            question_index = 0
+            while True:
+                current_summary = result.current_summary
+                self.state_manager.update_clarification_session(
+                    session_id=session_id,
+                    current_summary=current_summary,
+                    status="active",
+                )
+                self.state_manager.update_clarification_draft(
+                    draft_id=draft.id,
+                    messages=messages,
+                    current_summary=current_summary,
+                    status="resumed",
+                )
+                self._render_clarification_result(result, debug=debug)
+
+                if result.is_clear:
+                    self.state_manager.update_clarification_session(
+                        session_id=session_id,
+                        current_summary=current_summary,
+                        status="clarified",
+                    )
+                    self.state_manager.update_clarification_draft(
+                        draft_id=draft.id,
+                        messages=messages,
+                        current_summary=current_summary,
+                        status="clarified",
+                    )
+                    self.state_manager.update_user_profile_from_summary(current_summary)
+                    self._render_ready_summary(current_summary)
+                    if no_plan:
+                        return
+
+                    generated_plan = self._generate_plan(
+                        client=client,
+                        model=settings.model,
+                        session_id=session_id,
+                        goal=draft.goal,
+                        summary=current_summary,
+                        memory_context=self.state_manager.build_memory_context(),
+                        web=web,
+                    )
+                    self.state_manager.update_clarification_draft(
+                        draft_id=draft.id,
+                        messages=messages,
+                        current_summary=current_summary,
+                        status="planned",
+                    )
+                    self._render_generated_plan(generated_plan)
+                    return
+
+                if question_index >= max_questions:
+                    self.state_manager.update_clarification_session(
+                        session_id=session_id,
+                        current_summary=current_summary,
+                        status="max_questions_reached",
+                    )
+                    self.state_manager.update_clarification_draft(
+                        draft_id=draft.id,
+                        messages=messages,
+                        current_summary=current_summary,
+                        status="max_questions_reached",
+                    )
+                    self.console.print(
+                        Panel.fit(
+                            f"本次恢复已达到最大追问轮数，草稿 #{draft.id} 已更新。\n"
+                            f"之后仍可运行 `aura goal resume --draft-id {draft.id}` 继续。",
+                            title="目标拆解暂停",
+                            border_style="yellow",
+                        )
+                    )
+                    return
+
+                if not result.next_question:
+                    raise ClarifierError("DeepSeek 判断信息不足，但没有给出下一个问题。")
+
+                question_index += 1
+                self._render_next_question(result.next_question, question_index)
+                answer = self.terminal_input.ask("你的回答")
+                if self._is_exit_command(answer):
+                    self.state_manager.update_clarification_session(
+                        session_id=session_id,
+                        current_summary=current_summary,
+                        status="interrupted",
+                    )
+                    self.state_manager.update_clarification_draft(
+                        draft_id=draft.id,
+                        messages=messages,
+                        current_summary=current_summary,
+                        status="interrupted",
+                    )
+                    self.console.print(
+                        Panel.fit(
+                            f"草稿 #{draft.id} 已保存，你可以之后继续恢复。",
+                            title="已保存并退出",
+                            border_style="yellow",
+                        )
+                    )
+                    return
+
+                self.state_manager.record_question_answer(
+                    session_id=session_id,
+                    goal=draft.goal,
+                    question=result.next_question,
+                    answer=answer,
+                )
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": f"你刚才的问题是：{result.next_question}\n我的回答是：{answer.strip()}",
+                    }
+                )
+                result = self._request_clarification(clarifier, messages)
+        except ClarifierError as exc:
+            self.console.print(f"[red]目标拆解恢复失败：{exc}[/red]")
+            raise typer.Exit(code=1) from exc
+        except (ValueError, PlanGenerationError) as exc:
+            self.console.print(f"[red]计划生成失败：{exc}[/red]")
+            raise typer.Exit(code=1) from exc
+
     def memory_show(
         self,
         recent_limit: Annotated[
@@ -440,6 +619,10 @@ class AuraCLI:
             int | None,
             typer.Option("--session-id", "-s", help="使用指定澄清会话生成计划。"),
         ] = None,
+        draft_id: Annotated[
+            int | None,
+            typer.Option("--draft-id", "-d", help="使用目标拆解草稿补生成计划。"),
+        ] = None,
         goal: Annotated[
             str | None,
             typer.Option("--goal", help="手动指定原始目标，需同时提供 --summary。"),
@@ -463,11 +646,33 @@ class AuraCLI:
         if bool(goal) != bool(summary):
             self.console.print("[red]--goal 和 --summary 必须同时提供。[/red]")
             raise typer.Exit(code=1)
+        if draft_id is not None and (session_id is not None or goal or summary):
+            self.console.print("[red]--draft-id 不能与 --session-id、--goal 或 --summary 同时使用。[/red]")
+            raise typer.Exit(code=1)
 
         selected_session_id: int | None = None
         plan_goal = goal or ""
         plan_summary = summary or ""
-        if not plan_goal:
+        if draft_id is not None:
+            draft = self.state_manager.get_clarification_draft(draft_id)
+            if draft is None:
+                self.console.print(f"[red]草稿 #{draft_id} 不存在。[/red]")
+                raise typer.Exit(code=1)
+            if not draft.current_summary.strip():
+                self.console.print("[red]这个草稿还没有可用摘要，请先运行 `aura goal resume --draft-id ...`。[/red]")
+                raise typer.Exit(code=1)
+            selected_session_id = self.state_manager.create_clarification_session(draft.goal)
+            plan_goal = draft.goal
+            plan_summary = (
+                f"{draft.current_summary.strip()}\n\n"
+                f"草稿对话上下文：\n{self._messages_to_context(draft.messages)}"
+            )
+            self.state_manager.update_clarification_session(
+                session_id=selected_session_id,
+                current_summary=draft.current_summary,
+                status="planned_from_draft",
+            )
+        elif not plan_goal:
             session = self.state_manager.get_clarification_session(session_id=session_id)
             if session is None:
                 self.console.print("[red]没有找到可用于生成计划的澄清会话，请先运行 `aura goal add`。[/red]")
@@ -488,6 +693,15 @@ class AuraCLI:
                 memory_context=memory_context,
                 web=web,
             )
+            if draft_id is not None:
+                draft = self.state_manager.get_clarification_draft(draft_id)
+                if draft is not None:
+                    self.state_manager.update_clarification_draft(
+                        draft_id=draft.id,
+                        messages=draft.messages,
+                        current_summary=draft.current_summary,
+                        status="planned",
+                    )
             self._render_generated_plan(generated_plan)
         except (ValueError, PlanGenerationError) as exc:
             self.console.print(f"[red]计划生成失败：{exc}[/red]")
@@ -785,6 +999,32 @@ class AuraCLI:
     ) -> ClarificationResult:
         with self.console.status("[bold cyan]Aura 正在思考...[/bold cyan]", spinner="dots"):
             return clarifier.evaluate_messages(messages)
+
+    def _result_from_last_assistant(
+        self,
+        clarifier: ClarificationAgent,
+        messages: list[ChatMessage],
+    ) -> ClarificationResult | None:
+        for message in reversed(messages):
+            if message.get("role") != "assistant":
+                continue
+            try:
+                return clarifier._parse_result(message.get("content", ""))
+            except ClarifierError:
+                return None
+        return None
+
+    def _messages_to_context(self, messages: list[ChatMessage]) -> str:
+        context_lines: list[str] = []
+        for message in messages:
+            role = message.get("role", "unknown")
+            if role == "system":
+                continue
+            content = " ".join(message.get("content", "").split())
+            if not content:
+                continue
+            context_lines.append(f"- {role}: {content[:800]}")
+        return "\n".join(context_lines) or "暂无可用对话上下文。"
 
     def _generate_plan(
         self,

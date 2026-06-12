@@ -24,6 +24,17 @@ class StoredClarificationSession:
 
 
 @dataclass(frozen=True, slots=True)
+class StoredClarificationDraft:
+    """A saved clarification conversation that can be resumed."""
+
+    id: int
+    goal: str
+    messages: list[ChatMessage]
+    current_summary: str
+    status: str
+
+
+@dataclass(frozen=True, slots=True)
 class StoredLearningPlan:
     """A persisted learning plan."""
 
@@ -248,6 +259,63 @@ class StateManager:
                 ),
             )
             return int(cursor.lastrowid)
+
+    def get_clarification_draft(self, draft_id: int) -> StoredClarificationDraft | None:
+        """Return a saved clarification draft by id."""
+
+        self.initialize()
+        with sqlite3.connect(self.db_path) as connection:
+            row = connection.execute(
+                """
+                SELECT id, goal, messages_json, current_summary, status
+                FROM clarification_drafts
+                WHERE id = ?
+                """,
+                (draft_id,),
+            ).fetchone()
+        if not row:
+            return None
+
+        try:
+            messages = json.loads(str(row[2]))
+        except json.JSONDecodeError:
+            messages = []
+
+        return StoredClarificationDraft(
+            id=int(row[0]),
+            goal=str(row[1]),
+            messages=messages,
+            current_summary=str(row[3]),
+            status=str(row[4]),
+        )
+
+    def update_clarification_draft(
+        self,
+        draft_id: int,
+        messages: list[ChatMessage],
+        current_summary: str,
+        status: str,
+    ) -> None:
+        """Update a saved clarification draft after resume."""
+
+        self.initialize()
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                """
+                UPDATE clarification_drafts
+                SET messages_json = ?,
+                    current_summary = ?,
+                    status = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    json.dumps(messages, ensure_ascii=False),
+                    current_summary.strip(),
+                    status,
+                    draft_id,
+                ),
+            )
 
     def create_tasks_from_plan_markdown(self, plan_id: int, markdown: str) -> None:
         """Extract sequence tasks from plan Markdown and store them without due dates."""
