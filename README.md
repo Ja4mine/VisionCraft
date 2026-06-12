@@ -27,8 +27,8 @@ pip install -e .
 aura init
 aura config
 aura config --show
-aura goal add "我想系统学习密码学"
-aura goal add "我想系统学习密码学" --no-plan
+aura goal add "我想系统学习数学"
+aura goal add "我想系统学习数学" --no-plan
 aura plan generate
 aura plan generate --no-web
 aura daily
