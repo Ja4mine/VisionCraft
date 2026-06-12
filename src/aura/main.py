@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 from typing import Annotated
 
@@ -94,6 +95,7 @@ class AuraCLI:
         self.app.callback()(self._version_callback)
         self.app.command("config")(self.config)
         self.app.command("init")(self.init)
+        self.app.command("reset")(self.reset)
         self.app.command("daily")(self.daily)
         self.app.command("tree")(self.tree)
         self.goal_app.command("add")(self.goal_add)
@@ -173,6 +175,76 @@ class AuraCLI:
                 "本地状态数据库已准备好。\n"
                 "下一步可以运行 `aura config` 配置 DeepSeek API Key。",
                 title="Aura 初始化完成",
+                border_style="green",
+            )
+        )
+
+    def reset(
+        self,
+        yes: Annotated[
+            bool,
+            typer.Option("--yes", "-y", help="跳过交互确认。"),
+        ] = False,
+        include_config: Annotated[
+            bool,
+            typer.Option("--include-config", help="同时删除 API Key、模型和 Obsidian 配置。"),
+        ] = False,
+        include_obsidian: Annotated[
+            bool,
+            typer.Option("--include-obsidian", help="同时删除 Obsidian vault 中的 Aura 导出目录。"),
+        ] = False,
+        keep_plans: Annotated[
+            bool,
+            typer.Option("--keep-plans", help="保留本地 plans/ 目录中的 Markdown 文件。"),
+        ] = False,
+    ) -> None:
+        """Reset Aura by clearing local cache, generated history, and stored state."""
+
+        settings = self.config_manager.load()
+        targets = [
+            f"SQLite 状态数据库: {self.state_manager.db_path}",
+            "Python 缓存: __pycache__ / .pytest_cache / .mypy_cache / .ruff_cache",
+        ]
+        if not keep_plans:
+            targets.append("本地计划文件: plans/*.md")
+        if include_obsidian and settings.obsidian_vault_path:
+            targets.append(
+                f"Obsidian 导出目录: {Path(settings.obsidian_vault_path).expanduser() / settings.obsidian_folder}"
+            )
+        if include_config:
+            targets.append(f"Aura 配置文件: {self.config_manager.config_path}")
+
+        self.console.print(
+            Panel(
+                "\n".join(f"- {target}" for target in targets),
+                title="即将清空以下 Aura 数据",
+                border_style="yellow",
+            )
+        )
+
+        if not yes:
+            confirmation = self.terminal_input.ask("确认格式化 Aura？请输入 RESET 继续")
+            if confirmation.strip() != "RESET":
+                self.console.print("[yellow]已取消 reset。[/yellow]")
+                raise typer.Exit()
+
+        self.state_manager.reset(reinitialize=True)
+        removed_plans = 0 if keep_plans else self._clear_generated_plans()
+        removed_caches = self._clear_python_caches()
+        removed_obsidian = False
+        if include_obsidian:
+            removed_obsidian = self._clear_obsidian_exports(settings.obsidian_vault_path, settings.obsidian_folder)
+        if include_config:
+            self.config_manager.delete()
+
+        self.console.print(
+            Panel.fit(
+                f"数据库已重置。\n"
+                f"删除计划文件: {removed_plans}\n"
+                f"删除缓存目录: {removed_caches}\n"
+                f"删除 Obsidian 导出: {'是' if removed_obsidian else '否'}\n"
+                f"删除配置文件: {'是' if include_config else '否'}",
+                title="Aura 已格式化",
                 border_style="green",
             )
         )
@@ -958,6 +1030,48 @@ class AuraCLI:
                 border_style="green",
             )
         )
+
+    def _clear_generated_plans(self) -> int:
+        plans_dir = Path("plans")
+        if not plans_dir.exists():
+            return 0
+
+        removed = 0
+        for path in sorted(plans_dir.rglob("*"), reverse=True):
+            if path.name == ".gitkeep":
+                continue
+            if path.is_file() or path.is_symlink():
+                path.unlink()
+                removed += 1
+            elif path.is_dir():
+                try:
+                    path.rmdir()
+                except OSError:
+                    pass
+        return removed
+
+    def _clear_python_caches(self) -> int:
+        removed = 0
+        cache_names = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+        for path in sorted(Path(".").rglob("*"), reverse=True):
+            if path.name not in cache_names or not path.is_dir():
+                continue
+            shutil.rmtree(path)
+            removed += 1
+        return removed
+
+    def _clear_obsidian_exports(self, vault_path: str, folder: str) -> bool:
+        if not vault_path.strip():
+            return False
+
+        export_dir = Path(vault_path).expanduser() / (folder.strip().strip("/") or "VisionCraft")
+        if not export_dir.exists():
+            return False
+        if export_dir.name in {"", ".", ".."}:
+            return False
+
+        shutil.rmtree(export_dir)
+        return True
 
     def _is_exit_command(self, value: str) -> bool:
         return value.strip().lower() in {"exit", "quit"}

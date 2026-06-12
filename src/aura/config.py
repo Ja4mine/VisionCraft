@@ -84,3 +84,9 @@ class ConfigManager:
             settings.obsidian_folder = folder.strip() or AuraSettings.obsidian_folder
         self.save(settings)
         return settings
+
+    def delete(self) -> None:
+        """Delete the local config file if it exists."""
+
+        if self.config_path.exists():
+            self.config_path.unlink()

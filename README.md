@@ -39,6 +39,8 @@ aura memory show
 aura obsidian config --vault "/path/to/ObsidianVault"
 aura obsidian sync
 aura plan metadata --plan-id 1 --category red-team --priority 1 --importance 5
+aura reset
+aura reset --yes --include-config --include-obsidian
 ```
 
 Aura 会使用本地 SQLite 保存目标澄清会话、每轮提问回答、用户画像摘要和学习习惯。
@@ -57,3 +59,5 @@ Aura 的每日调度不使用“逾期任务”。计划任务会绑定到 `Sequ
 运行 `aura tree` 可以把当前计划渲染为目标拓扑。Aura 会先判断目标是探索型学习 `learning_divergent` 还是交付型任务 `task_convergent`：前者用发散技能树展示，后者用收束里程碑管道展示。已完成节点为绿色 `[✓]`，进行中节点为蓝色，锁定节点为暗灰色。
 
 配置 Obsidian vault 后，Aura 会把新生成或调整后的计划自动同步到 `VisionCraft/Plans`，并维护 `VisionCraft Plan Index.md` 索引页。每个计划都会带 YAML frontmatter，包含分类、状态、优先级和重要性，方便在 Obsidian 或 Dataview 中管理。
+
+运行 `aura reset` 可以格式化 Aura：清空 SQLite 历史、生成计划和 Python 缓存。默认保留 API Key 与 Obsidian 配置；如果需要完全清空，可以加 `--include-config`，如果也要删除 Obsidian 中的 Aura 导出目录，可以加 `--include-obsidian`。

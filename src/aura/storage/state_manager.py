@@ -74,6 +74,14 @@ class StateManager:
     def __init__(self, db_path: Path | None = None) -> None:
         self.db_path = db_path or Path.home() / ".local" / "share" / "visioncraft" / "aura.db"
 
+    def reset(self, reinitialize: bool = True) -> None:
+        """Delete all persisted Aura state and optionally recreate empty tables."""
+
+        if self.db_path.exists():
+            self.db_path.unlink()
+        if reinitialize:
+            self.initialize()
+
     def initialize(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(self.db_path) as connection:
