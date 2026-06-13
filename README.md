@@ -68,5 +68,8 @@ Aura 的每日调度不使用“逾期任务”。计划任务会绑定到 `Sequ
 
 可从通过下方链接直接安装。
 ```bash
-pip install -i https://test.pypi.org/simple/ visioncraft-aura
+pip install \
+  --index-url https://test.pypi.org/simple/ \
+  --extra-index-url https://pypi.org/simple/ \
+  visioncraft-aura
 ```
