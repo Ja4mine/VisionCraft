@@ -65,3 +65,8 @@ Aura 的每日调度不使用“逾期任务”。计划任务会绑定到 `Sequ
 配置 Obsidian vault 后，Aura 会把新生成或调整后的计划自动同步到 `VisionCraft/Plans`，并维护 `VisionCraft Plan Index.md` 索引页。每个计划都会带 YAML frontmatter，包含分类、状态、优先级和重要性，方便在 Obsidian 或 Dataview 中管理。
 
 运行 `aura reset` 可以格式化 Aura：清空 SQLite 历史、生成计划和 Python 缓存。默认保留 API Key 与 Obsidian 配置；如果需要完全清空，可以加 `--include-config`，如果也要删除 Obsidian 中的 Aura 导出目录，可以加 `--include-obsidian`。
+
+可从通过下方链接直接安装。
+```bash
+pip install -i https://test.pypi.org/simple/ visioncraft-aura
+```
