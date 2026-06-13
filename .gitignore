@@ -11,3 +11,7 @@ venv/
 *.db
 
 plans/
+
+
+src/visioncraft_aura.egg-info/
+plans/*.md
